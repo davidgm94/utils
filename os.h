@@ -34,6 +34,12 @@
 #define RED_OS_SEP_CHAR '/'
 #endif
 
+typedef union OS_SemaphoreInternal
+{
+    volatile void* win32_handle;
+    volatile unsigned char posix_handle;
+} volatile OS_Semaphore;
+
 typedef enum TerminationID
 {
     CLEAN,
@@ -74,6 +80,7 @@ void os_exit(s32 code);
 void* allocate_chunk(size_t size);
 void* reallocate_chunk(void* allocated_address, usize size);
 void  mem_init(void);
+void os_print_memory_usage(void);
 
 
 #define RED_NOT_IMPLEMENTED { red_panic(__FILE__, __LINE__, __func__, "Not implemented"); __debugbreak(); os_exit(1); }
@@ -115,8 +122,52 @@ static inline void p_type_prefix##_ensure_capacity(t_type* buffer_name, u32 new_
     do {\
         better_capacity = better_capacity * 5 / 2 + 8;\
     } while (better_capacity < new_capacity);\
-
-void os_init(void(*mem_init)(void));
+\
+    buffer_name->ptr = RENEW(elem_type, buffer_name->ptr, better_capacity);\
+    buffer_name->cap = better_capacity;\
+}\
+\
+static inline void p_type_prefix##_resize(t_type* buffer_name, size_t new_length)\
+{\
+    redassert(new_length != SIZE_MAX);\
+    p_type_prefix##_ensure_capacity(buffer_name, new_length);\
+}\
+\
+static inline void p_type_prefix##_append(t_type* buffer_name, elem_type item)\
+{\
+    p_type_prefix##_ensure_capacity(buffer_name, buffer_name->len + 1);\
+    buffer_name->ptr[buffer_name->len++] = item;\
+}\
+\
+static inline void p_type_prefix##_append_assuming_capacity(t_type* buffer_name, elem_type item)\
+{\
+    buffer_name->ptr[buffer_name->len++] = item;\
+}\
+\
+static inline elem_type p_type_prefix##_pop(t_type* buffer_name)\
+{\
+    redassert(buffer_name->len >= 1);\
+    return buffer_name->ptr[--buffer_name->len];\
+}\
+\
+static inline elem_type* p_type_prefix##_last(t_type* buffer_name)\
+{\
+    redassert(buffer_name->len >= 1);\
+    return &buffer_name->ptr[buffer_name->len - 1];\
+}\
+\
+static inline elem_type* p_type_prefix##_add_one(t_type* buffer_name)\
+{\
+    p_type_prefix##_resize(buffer_name, buffer_name->len + 1);\
+    buffer_name->len++;\
+    return p_type_prefix##_last(buffer_name);\
+}\
+\
+static inline void p_type_prefix##_clear(t_type* buffer_name)\
+{\
+    buffer_name->len = 0;\
+}
+void os_init();
 SB* os_get_cwd(void);
 void* os_ask_virtual_memory_block(size_t block_bytes);
 void* os_ask_virtual_memory_block_with_address(void* target_address, size_t block_bytes);
