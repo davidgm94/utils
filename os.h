@@ -7,6 +7,7 @@
 #include "types.h"
 #include <inttypes.h>
 #include <string.h>
+#include <stdarg.h>
 
 
 #if __linux__
@@ -56,7 +57,7 @@ typedef struct Termination
 
 typedef struct ExplicitTimer
 {
-    s64 start_time;
+    u64 start_time;
     char* text;
 } ExplicitTimer;
 
@@ -81,11 +82,12 @@ void* allocate_chunk(size_t size);
 void* reallocate_chunk(void* allocated_address, usize size);
 void  mem_init(void);
 void os_print_memory_usage(void);
+void os_debug_break(void);
 
 
-#define RED_NOT_IMPLEMENTED { red_panic(__FILE__, __LINE__, __func__, "Not implemented"); __debugbreak(); os_exit(1); }
-#define RED_UNREACHABLE { red_panic(__FILE__, __LINE__, __func__, "Unreachable"); __debugbreak(); os_exit(1); }
-#define RED_PANIC(...) {  red_panic(__FILE__, __LINE__, __func__, __VA_ARGS__);  __debugbreak(); os_exit(1);}
+#define RED_NOT_IMPLEMENTED { red_panic(__FILE__, __LINE__, __func__, "Not implemented"); os_debug_break(); os_exit(1); }
+#define RED_UNREACHABLE { red_panic(__FILE__, __LINE__, __func__, "Unreachable"); os_debug_break(); os_exit(1); }
+#define RED_PANIC(...) {  red_panic(__FILE__, __LINE__, __func__, __VA_ARGS__);  os_debug_break(); os_exit(1);}
 
 #ifdef RED_DEBUG
 #define redassert(_expr) if (!(_expr)) { RED_PANIC("Expression " #_expr " is false\n"); }
@@ -179,7 +181,7 @@ void os_exit(s32 code);
 void os_exit_with_message(const char* message, ...);
 void os_print_recorded_times(f64 total_ms);
 s64 os_performance_counter(void);
-f64 os_compute_ms(s64 pc_start, s64 pc_end);
+f64 os_compute_ms(u64 pc_start, u64 pc_end);
 s32 os_load_dynamic_library(const char* dyn_lib_name);
 void* os_load_procedure_from_dynamic_library(s32 dyn_lib_index, const char* proc_name);
 StringBuffer* os_file_load(const char* name);

@@ -8,6 +8,9 @@
 #define RED_OS_POSIX
 #include <unistd.h>
 #include <linux/limits.h>
+#include <sys/sysinfo.h>
+#include <sys/mman.h>
+#include <time.h>
 #elif defined RED_OS_WINDOWS
 #include <Windows.h>
 #endif
@@ -17,15 +20,6 @@
 #include <stdio.h>
 #include <stdarg.h>
 
-// Static cached structures 
-#ifdef RED_OS_WINDOWS
-static SYSTEM_INFO system_info;
-static usize page_size;
-static u16 logical_thread_count;
-static LARGE_INTEGER pfreq;
-static HINSTANCE loaded_dlls[1000];
-static u16 dll_count = 0;
-
 typedef struct TimeRecord
 {
     f64 time_ms;
@@ -34,40 +28,47 @@ typedef struct TimeRecord
 
 static struct TimeRecord records[100] = {0};
 static u32 record_count = 0;
+static usize page_size;
+static u16 logical_thread_count;
+static u16 shared_library_count;
 
-#else
-#endif
+#define CACHE_LINE_SIZE BYTE(64)
+#define MAX_ALLOCATED_BLOCK_COUNT 4
+#define BLOCK_ALIGNMENT CACHE_LINE_SIZE
+#define BLOCK_SIZE GIGABYTE(4)
+#define DEFAULT_ALIGNMENT 16
 
-ExplicitTimer os_timer_start(const char* text)
+struct MemoryBlock
 {
-#ifdef RED_OS_WINDOWS
-    ExplicitTimer et;
-    QueryPerformanceCounter((LARGE_INTEGER*)&et.start_time);
-    et.text = (char*)text;
-    return et;
-#else
-#endif
-}
+    void* address;
+    void* aligned_address;
+    void* available_address;
+};
 
-f64 os_timer_end(ExplicitTimer* et)
+typedef struct Allocation
 {
-#ifdef RED_OS_WINDOWS
-    LARGE_INTEGER end;
-    QueryPerformanceCounter(&end);
-    f64 ms_time = (f64)(end.QuadPart - et->start_time) / (f64)(pfreq.QuadPart);
-    SB* sb = sb_alloc();
-    sb_strcpy(sb, et->text);
-    redassert(record_count + 1 != array_length(records));
-    records[record_count].time_ms = ms_time;
-    records[record_count].text = sb;
-    record_count++;
+    u32 alignment;
+    u32 size;
+} Allocation;
 
-    return ms_time;
+typedef struct PageAllocator
+{
+    void* available_address;
+    usize allocation_count;
+    usize allocated_block_count;
+    void* blob;
+    usize page_size;
+} PageAllocator;
+
+static struct PageAllocator m_page_allocator;
+
+// Static cached structures 
+#ifdef RED_OS_WINDOWS
+static SYSTEM_INFO system_info;
+static LARGE_INTEGER pfreq;
+static HINSTANCE loaded_dlls[1000];
 #else
-#error
 #endif
-}
-static inline void os_mem_init(void);
 
 void os_init(void)
 {
@@ -76,11 +77,54 @@ void os_init(void)
     page_size = system_info.dwPageSize > system_info.dwAllocationGranularity ? system_info.dwPageSize : system_info.dwAllocationGranularity;
     logical_thread_count = system_info.dwNumberOfProcessors;
     QueryPerformanceFrequency(&pfreq);
+#elif defined(RED_OS_LINUX)
+    page_size = getpagesize();
+    logical_thread_count = get_nprocs();
 #else
 #error
 #endif
-    os_mem_init();
+    m_page_allocator.page_size = page_size;
 }
+
+ExplicitTimer os_timer_start(const char* text)
+{
+    ExplicitTimer et;
+#ifdef RED_OS_WINDOWS
+    QueryPerformanceCounter((LARGE_INTEGER*)&et.start_time);
+    et.text = (char*)text;
+#elif defined (__linux__)
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    et.start_time = (u64)ts.tv_sec * 1000000000 + (u64)ts.tv_nsec;
+#else
+#error
+#endif
+    return et;
+}
+
+f64 os_timer_end(ExplicitTimer* et)
+{
+#ifdef RED_OS_WINDOWS
+    LARGE_INTEGER end;
+    QueryPerformanceCounter(&end);
+    f64 ms_time = (f64)(end.QuadPart - et->start_time) / (f64)(pfreq.QuadPart);
+#elif defined (__linux__)
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    u64 end_time = (u64)ts.tv_sec * 1000000000 + (u64)ts.tv_nsec;
+    f64 ms_time = (f64)(end_time - et->start_time) / 1000000;
+#else
+#error
+#endif
+    SB* sb = sb_alloc();
+    sb_strcpy(sb, et->text);
+    redassert(record_count + 1 != array_length(records));
+    records[record_count].time_ms = ms_time;
+    records[record_count].text = sb;
+    record_count++;
+    return ms_time;
+}
+
 
 SB* os_get_cwd(void)
 {
@@ -91,8 +135,9 @@ SB* os_get_cwd(void)
     {
         RED_PANIC("Unable to get cwd: %s", strerror(errno));
     }
-    buf_init_from_str(out_cwd, result);
-    return ERROR_NONE;
+    SB* sb = sb_alloc_fixed(strlen(result));
+    sb_strcpy(sb, result);
+    return sb;
 #else
     char buffer[MAX_PATH];
     DWORD result = GetCurrentDirectoryA(MAX_PATH, buffer);
@@ -112,6 +157,8 @@ void* os_ask_virtual_memory_block(size_t block_bytes)
     void* address = NULL;
 #ifdef RED_OS_WINDOWS
     address = VirtualAlloc(NULL, block_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#elif defined(RED_OS_LINUX)
+    address = mmap(NULL, block_bytes, PROT_WRITE | PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 #else
 #error
 #endif
@@ -123,6 +170,9 @@ void* os_ask_virtual_memory_block_with_address(void* target_address, size_t bloc
     void* address = NULL;
 #ifdef RED_OS_WINDOWS
     address = VirtualAlloc(target_address, block_bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#elif defined(RED_OS_LINUX)
+    // If the address could not be satisfied, the allocation fails!
+    address = mmap(target_address, block_bytes, PROT_READ | PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
 #else
 #error
 #endif
@@ -140,9 +190,7 @@ void* os_ask_heap_memory(size_t size)
 
 size_t os_get_page_size(void)
 {
-#ifdef RED_OS_WINDOWS
     return page_size;
-#endif
 }
 
 static void os_windows_create_command_line(SB* command_line, const char* exe, const char** args)
@@ -170,6 +218,7 @@ static void os_windows_create_command_line(SB* command_line, const char* exe, co
     }
 }
 
+#ifdef RED_OS_WINDOWS
 void os_spawn_process_windows(const char* exe, os_arg_list args, Termination* termination)
 {
     SB* command_line = sb_alloc();
@@ -199,13 +248,19 @@ void os_spawn_process_windows(const char* exe, os_arg_list args, Termination* te
     termination->type = CLEAN;
     termination->code = exit_code;
 }
+#endif
+
+void os_spawn_processs_linux(void)
+{
+    RED_NOT_IMPLEMENTED;
+}
 
 void os_spawn_process(const char* exe, os_arg_list args, Termination* termination)
 {
 #ifdef RED_OS_WINDOWS
     os_spawn_process_windows(exe, args, termination);
 #else
-#error
+    os_spawn_processs_linux();
 #endif
 }
 
@@ -244,16 +299,23 @@ void os_abort(void)
     abort();
 }
 
+#ifdef RED_OS_WINDOWS
 s64 os_performance_counter(void)
 {
     s64 pc;
     QueryPerformanceCounter((LARGE_INTEGER*)&pc);
     return pc;
 }
+#endif
 
-f64 os_compute_ms(s64 pc_start, s64 pc_end)
+f64 os_compute_ms(u64 pc_start, u64 pc_end)
 {
+#ifdef RED_OS_WINDOWS
     return (f64)(pc_end - pc_start) / (f64)pfreq.QuadPart;
+#elif defined(RED_OS_LINUX)
+    // Result is given in nanoseconds, we must convert them into ms (* 10**(-6))
+    return (f64)(pc_end - pc_start) / (1000 * 1000);
+#endif
 }
 
 s32 os_load_dynamic_library(const char* dyn_lib_name)
@@ -270,11 +332,14 @@ s32 os_load_dynamic_library(const char* dyn_lib_name)
     loaded_dlls[id] = dll_instance;
     return id;
 #else
+    RED_NOT_IMPLEMENTED;
+    return 0;
 #endif
 }
 
 void* os_load_procedure_from_dynamic_library(s32 dyn_lib_index, const char* proc_name)
 {
+#ifdef RED_OS_WINDOWS
     FARPROC fn_ptr = GetProcAddress(loaded_dlls[dyn_lib_index], proc_name);
     if (!fn_ptr)
     {
@@ -283,7 +348,12 @@ void* os_load_procedure_from_dynamic_library(s32 dyn_lib_index, const char* proc
     }
 
     return (void*)fn_ptr;
+#else
+    RED_NOT_IMPLEMENTED;
+    return null;
+#endif
 }
+
 void sb_vprintf(SB* sb, const char* format, va_list ap)
 {
     va_list ap2;
@@ -339,35 +409,6 @@ StringBuffer* os_file_load(const char *name)
     return file_buffer;
 }
 
-#define CACHE_LINE_SIZE BYTE(64)
-#define MAX_ALLOCATED_BLOCK_COUNT 4
-#define BLOCK_ALIGNMENT CACHE_LINE_SIZE
-#define BLOCK_SIZE GIGABYTE(4)
-#define DEFAULT_ALIGNMENT 16
-
-struct MemoryBlock
-{
-    void* address;
-    void* aligned_address;
-    void* available_address;
-};
-
-typedef struct Allocation
-{
-    u32 alignment;
-    u32 size;
-} Allocation;
-
-typedef struct PageAllocator
-{
-    void* available_address;
-    usize allocation_count;
-    usize allocated_block_count;
-    void* blob;
-    usize page_size;
-} PageAllocator;
-
-static struct PageAllocator m_page_allocator;
 
 typedef enum AllocationResult
 {
@@ -578,7 +619,11 @@ void red_panic(const char* file, size_t line, const char* function, const char* 
     va_end(args);
 
     sprintf(buffer2, "Panic at %s:%zu: %s -> %s\n", file, line, function, buffer);
+#ifdef RED_OS_WINDOWS
     MessageBoxA(GetActiveWindow(), buffer2, "PANIC", MB_ABORTRETRYIGNORE);
+#else
+    printf("[PANIC] %s\n", buffer2);
+#endif
 }
 
 void os_print_memory_usage(void)
@@ -590,7 +635,19 @@ void os_print_memory_usage(void)
     print("\nMemory usage: %llu bytes. Available: %llu bytes. Relative usage: %02.02f%%. Total allocations: %llu\n", mem_usage, block_size, ((f64)mem_usage / (f64)block_size) * 100.0f, alloc_count);
 }
 
-static inline void os_mem_init(void)
+void os_debug_break(void)
 {
-m_page_allocator.page_size = os_get_page_size();
+#if defined(RED_OS_WINDOWS)
+    __debugbreak();
+#elif defined RED_OS_LINUX
+    #if __has_builtin(__builtin_trap)
+    #else
+        #ifdef(SIGTRAP)
+            raise(SIGTRAP);
+        #else
+            #error
+        #endif
+    #endif
+#endif
 }
+
